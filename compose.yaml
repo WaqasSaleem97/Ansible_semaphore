@@ -1,6 +1,6 @@
 services:
   semaphore:
-    image: semaphoreui/semaphore:latest
+    build: .
     container_name: semaphore
     ports:
       - "3000:3000"
@@ -10,4 +10,9 @@ services:
       SEMAPHORE_ADMIN_PASSWORD: changeme
       SEMAPHORE_ADMIN_NAME: Admin
       SEMAPHORE_ADMIN_EMAIL: admin@localhost
+    volumes:
+      - semaphore_data:/var/lib/semaphore
+      - ./reports:/reports
     restart: unless-stopped
+volumes:
+  semaphore_data:
