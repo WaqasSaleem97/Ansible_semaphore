@@ -1,18 +1,21 @@
 services:
   semaphore:
-    build: .
+    image: semaphoreui/semaphore:latest
+    user: "1001:0"
     container_name: semaphore
     ports:
       - "3000:3000"
     environment:
-      SEMAPHORE_DB_DIALECT: bolt
+      SEMAPHORE_DB_DIALECT: sqlite
       SEMAPHORE_ADMIN: admin
       SEMAPHORE_ADMIN_PASSWORD: changeme
       SEMAPHORE_ADMIN_NAME: Admin
       SEMAPHORE_ADMIN_EMAIL: admin@localhost
     volumes:
-      - semaphore_data:/var/lib/semaphore
+      - semaphore-data:/var/lib/semaphore
       - ./reports:/reports
+      - ./playbooks:/playbooks
     restart: unless-stopped
+
 volumes:
-  semaphore_data:
+  semaphore-data:
