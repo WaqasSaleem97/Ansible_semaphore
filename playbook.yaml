@@ -1,0 +1,453 @@
+---
+- name: Collect System Info from Windows hosts
+  hosts: windows
+  gather_facts: no
+
+  tasks:
+
+  # -------------------------------------------------
+  # REPORT DIRECTORY (SEMAPHORE SAFE)
+  # -------------------------------------------------
+  - name: Ensure reports directory exists
+    delegate_to: localhost
+    run_once: true
+    file:
+      path: /reports
+      state: directory
+      mode: '0777'
+
+  - name: Remove old CSV
+    delegate_to: localhost
+    run_once: true
+    file:
+      path: /reports/report.csv
+      state: absent
+
+
+  # -------------------------------------------------
+  # SYSTEM HEADER
+  # -------------------------------------------------
+  - name: System Header
+    ansible.windows.win_shell: |
+      $obj = [ordered]@{
+        GeneratedOn = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Hostname    = $env:COMPUTERNAME
+      }
+
+      $obj | ConvertTo-Json -Compress
+    register: system_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # BIOS
+  # -------------------------------------------------
+  - name: BIOS Serial
+    ansible.windows.win_shell: |
+      $bios = Get-CimInstance Win32_BIOS
+      @{
+        bios_serial = $bios.SerialNumber
+        bios_version = $bios.Version
+      } | ConvertTo-Json -Compress
+    register: bios_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # DISK
+  # -------------------------------------------------
+  - name: Disk Info
+    ansible.windows.win_shell: |
+      $d = Get-PhysicalDisk | Select-Object -First 1
+
+      @{
+        model   = $d.Model
+        serial  = $d.SerialNumber
+        size_gb = "$([math]::Round($d.Size / 1GB,0)) GB"
+      } | ConvertTo-Json -Compress
+    register: disk_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # OS INFO
+  # -------------------------------------------------
+  - name: OS Info
+    ansible.windows.win_shell: |
+      $os = Get-CimInstance Win32_OperatingSystem
+
+      @{
+        name    = $os.Caption
+        version = $os.Version
+        install = ($os.InstallDate).ToString("yyyy-MM-dd HH:mm:ss")
+      } | ConvertTo-Json -Compress
+    register: os_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # ADMIN CHECK
+  # -------------------------------------------------
+  - name: Admin Check
+    ansible.windows.win_shell: |
+      try {
+        $u = net user administrator 2>$null
+
+        if ($u -match "Account active\s+Yes") {
+          $status = "ENABLED"
+        }
+        elseif ($u -match "Account active\s+No") {
+          $status = "DISABLED"
+        }
+        else {
+          $status = "UNKNOWN"
+        }
+      } catch {
+        $status = "UNKNOWN"
+      }
+
+      @{ admin = $status } | ConvertTo-Json -Compress
+    register: admin_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # DOMAIN CHECK
+  # -------------------------------------------------
+  - name: Domain Check
+    ansible.windows.win_shell: |
+      @{ domain = (Get-CimInstance Win32_ComputerSystem).PartOfDomain } | ConvertTo-Json -Compress
+    register: domain_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # FIREWALL DETECTION - AD DOMAIN AUTH PROXY CHECK
+  # -------------------------------------------------
+  - name: Firewall detection
+    ansible.windows.win_shell: |
+      $status = "OPEN_INTERNET"
+      $authRequired = "NO"
+      $finalUrl = "N/A"
+      
+      try {
+        # First check if machine is domain joined
+        $computerSystem = Get-CimInstance Win32_ComputerSystem
+        $isDomainJoined = $computerSystem.PartOfDomain
+        
+        if ($isDomainJoined) {
+          # Machine is domain joined - assume AD auth proxy is in place
+          # Check multiple registry locations for proxy configuration
+          
+          $proxyDetected = $false
+          
+          # Check User proxy settings
+          $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          $proxySettings = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+          
+          if ($proxySettings.ProxyEnable -eq 1) {
+            $proxyDetected = $true
+            $finalUrl = $proxySettings.ProxyServer
+          }
+          if ($proxySettings.AutoConfigURL) {
+            $proxyDetected = $true
+            $finalUrl = $proxySettings.AutoConfigURL
+          }
+          
+          # Check Group Policy proxy settings
+          $gpRegPath = "HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings"
+          $gpSettings = Get-ItemProperty -Path $gpRegPath -ErrorAction SilentlyContinue
+          
+          if ($gpSettings.ProxyEnable -eq 1) {
+            $proxyDetected = $true
+            $finalUrl = if ($gpSettings.ProxyServer) { $gpSettings.ProxyServer } else { "Configured via Group Policy" }
+          }
+          if ($gpSettings.AutoConfigURL) {
+            $proxyDetected = $true
+            $finalUrl = $gpSettings.AutoConfigURL
+          }
+          
+          # Check if domain joined + domain controllers present
+          $domainControllers = @()
+          try {
+            $domainInfo = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+            $domainControllers = $domainInfo.FindAllDomainControllers()
+            if ($domainControllers.Count -gt 0) {
+              $proxyDetected = $true
+            }
+          } catch {
+            # Continue
+          }
+          
+          # If any proxy is detected on domain-joined machine, assume auth is required
+          if ($proxyDetected) {
+            $status = "AD_AUTH_PROXY"
+            $authRequired = "YES"
+            if ($finalUrl -eq "N/A") {
+              $finalUrl = "Domain-configured proxy"
+            }
+          } else {
+            # Try to detect via network settings or IE settings
+            $ieRegPath = "HKCU:\Software\Microsoft\Internet Explorer\Main"
+            $ieSettings = Get-ItemProperty -Path $ieRegPath -ErrorAction SilentlyContinue
+            
+            if ($ieSettings -or (Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap")) {
+              # IE or proxy script detected
+              $status = "AD_AUTH_PROXY"
+              $authRequired = "YES"
+              $finalUrl = "Browser-configured or automatic proxy"
+            } else {
+              # No proxy detected on domain-joined machine
+              # But still likely has some form of auth requirement
+              $status = "DOMAIN_MACHINE"
+              $authRequired = "YES"
+              $finalUrl = "Domain authentication may be required"
+            }
+          }
+        } else {
+          # Machine not domain joined - check for any proxy
+          $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          $proxySettings = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+          
+          if ($proxySettings.ProxyEnable -eq 1 -or $proxySettings.AutoConfigURL) {
+            $status = "PROXY_DETECTED"
+            $authRequired = "YES"
+            $finalUrl = if ($proxySettings.AutoConfigURL) { $proxySettings.AutoConfigURL } else { $proxySettings.ProxyServer }
+          } else {
+            $status = "OPEN_INTERNET"
+            $authRequired = "NO"
+            $finalUrl = "N/A"
+          }
+        }
+        
+      } catch {
+        $status = "DETECTION_ERROR"
+        $authRequired = "UNKNOWN"
+        $finalUrl = "Error during detection"
+      }
+      
+      @{
+        firewall_detection = $status
+        redirected_to      = $finalUrl
+        auth_required      = $authRequired
+      } | ConvertTo-Json -Compress
+    register: fw_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # SOCIAL MEDIA
+  # -------------------------------------------------
+  - name: Social Media Connectivity
+    ansible.windows.win_shell: |
+      $ErrorActionPreference = "Stop"
+      $ProgressPreference = "SilentlyContinue"
+
+      $sites = @{
+        Facebook  = "https://www.facebook.com"
+        Reddit    = "https://www.reddit.com"
+        Instagram = "https://www.instagram.com"
+        LinkedIn  = "https://www.linkedin.com"
+        WhatsApp  = "https://web.whatsapp.com"
+        Twitter   = "https://twitter.com"
+        Pinterest = "https://www.pinterest.com"
+        TikTok    = "https://www.tiktok.com"
+        Snapchat  = "https://www.snapchat.com"
+        YouTube   = "https://www.youtube.com"
+      }
+
+      $result = [ordered]@{}
+
+      foreach ($site in $sites.GetEnumerator()) {
+        try {
+          $req = [System.Net.HttpWebRequest]::Create($site.Value)
+          $req.Method = "GET"
+          $req.Timeout = 6000
+          $req.UserAgent = "Mozilla/5.0"
+
+          $resp = $req.GetResponse()
+          $resp.Close()
+
+          $result[$site.Key] = "ACCESSIBLE"
+        }
+        catch {
+          $result[$site.Key] = "BLOCKED"
+        }
+      }
+
+      Write-Output ($result | ConvertTo-Json -Compress)
+    register: social_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # USB DEVICES
+  # -------------------------------------------------
+  - name: Collect USB Storage Devices History
+    ansible.windows.win_shell: |
+      $devices = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR" -Recurse -ErrorAction SilentlyContinue |
+                 Get-ItemProperty -Name FriendlyName -ErrorAction SilentlyContinue |
+                 Select-Object -ExpandProperty FriendlyName -Unique
+
+      if ($devices) {
+        @{ usb = ($devices -join "; ") } | ConvertTo-Json -Compress
+      } else {
+        @{ usb = "No USB devices found" } | ConvertTo-Json -Compress
+      }
+    register: usb_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # NETWORK INFO
+  # -------------------------------------------------
+  - name: Network Info
+    ansible.windows.win_shell: |
+      $net = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.NetAdapter.Name -notmatch "VMware|Hyper-V|VirtualBox|vEthernet" } | Select-Object -First 1
+
+      @{
+        ip     = $net.IPv4Address.IPAddress
+        mac    = $net.NetAdapter.MacAddress
+        name   = $net.InterfaceAlias
+        status = $net.NetAdapter.Status
+      } | ConvertTo-Json -Compress
+    register: net_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # WINDOWS TIME / NTP STATUS
+  # -------------------------------------------------
+  - name: Windows Time / NTP Status
+    ansible.windows.win_shell: |
+      $service = Get-Service w32time -ErrorAction SilentlyContinue
+      $source = w32tm /query /source 2>$null
+
+      if ($source -match "time.windows.com|pool") {
+        $type = "EXTERNAL_NTP"
+      }
+      elseif ($source -match "Domain") {
+        $type = "DOMAIN_SYNC"
+      }
+      else {
+        $type = "LOCAL_OR_UNKNOWN"
+      }
+
+      @{
+        service = $service.Status
+        source  = ($source | Out-String).Trim()
+        type    = $type
+      } | ConvertTo-Json -Compress
+    register: time_report
+    changed_when: false
+
+
+  # -------------------------------------------------
+  # FINAL ROW-WISE REPORT
+  # -------------------------------------------------
+  - name: Create Row Wise Report
+    delegate_to: localhost
+    run_once: true
+    copy:
+      dest: /reports/report.csv
+      content: |
+        Hosts{% for h in ansible_play_hosts_all %},{{ h }}{% endfor %}
+
+        Generated On{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].system_report.stdout | default('{}')) | from_json).GeneratedOn | default('N/A') }}{% endfor %}
+
+        Hostname{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].system_report.stdout | default('{}')) | from_json).Hostname | default('N/A') }}{% endfor %}
+
+        BIOS Serial{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].bios_report.stdout | default('{}')) | from_json).bios_serial | default('N/A') }}{% endfor %}
+
+        BIOS Version{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].bios_report.stdout | default('{}')) | from_json).bios_version | default('N/A') }}{% endfor %}
+
+        Disk Model{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].disk_report.stdout | default('{}')) | from_json).model | default('N/A') }}{% endfor %}
+
+        Disk Serial{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].disk_report.stdout | default('{}')) | from_json).serial | default('N/A') }}{% endfor %}
+
+        Disk Size{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].disk_report.stdout | default('{}')) | from_json).size_gb | default('N/A') }}{% endfor %}
+
+        OS Name{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].os_report.stdout | default('{}')) | from_json).name | default('N/A') }}{% endfor %}
+
+        OS Version{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].os_report.stdout | default('{}')) | from_json).version | default('N/A') }}{% endfor %}
+
+        OS Install Date{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].os_report.stdout | default('{}')) | from_json).install | default('N/A') }}{% endfor %}
+
+        Admin Status{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].admin_report.stdout | default('{}')) | from_json).admin | default('N/A') }}{% endfor %}
+
+        Domain Member{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].domain_report.stdout | default('{}')) | from_json).domain | default('N/A') }}{% endfor %}
+
+        Firewall Detection{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].fw_report.stdout | default('{}')) | from_json).firewall_detection | default('N/A') }}{% endfor %}
+
+        Redirected To{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].fw_report.stdout | default('{}')) | from_json).redirected_to | default('N/A') }}{% endfor %}
+
+        Auth Required{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].fw_report.stdout | default('{}')) | from_json).auth_required | default('N/A') }}{% endfor %}
+
+        Facebook{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).Facebook | default('N/A') }}{% endfor %}
+
+        Reddit{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).Reddit | default('N/A') }}{% endfor %}
+
+        Instagram{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).Instagram | default('N/A') }}{% endfor %}
+
+        LinkedIn{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).LinkedIn | default('N/A') }}{% endfor %}
+
+        WhatsApp{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).WhatsApp | default('N/A') }}{% endfor %}
+
+        Twitter{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).Twitter | default('N/A') }}{% endfor %}
+
+        Pinterest{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).Pinterest | default('N/A') }}{% endfor %}
+
+        TikTok{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).TikTok | default('N/A') }}{% endfor %}
+
+        Snapchat{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).Snapchat | default('N/A') }}{% endfor %}
+
+        YouTube{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].social_report.stdout | default('{}')) | from_json).YouTube | default('N/A') }}{% endfor %}
+
+        USB Devices{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].usb_report.stdout | default('{}')) | from_json).usb | default('N/A') }}{% endfor %}
+
+        IP Address{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].net_report.stdout | default('{}')) | from_json).ip | default('N/A') }}{% endfor %}
+
+        MAC Address{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].net_report.stdout | default('{}')) | from_json).mac | default('N/A') }}{% endfor %}
+
+        Adapter Name{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].net_report.stdout | default('{}')) | from_json).name | default('N/A') }}{% endfor %}
+
+        Adapter Status{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].net_report.stdout | default('{}')) | from_json).status | default('N/A') }}{% endfor %}
+
+        NTP Service{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].time_report.stdout | default('{}')) | from_json).service | default('N/A') }}{% endfor %}
+
+        NTP Source{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].time_report.stdout | default('{}')) | from_json).source | default('N/A') }}{% endfor %}
+
+        NTP Type{% for h in ansible_play_hosts_all %}
+        ,{{ ((hostvars[h].time_report.stdout | default('{}')) | from_json).type | default('N/A') }}{% endfor %}
