@@ -303,7 +303,7 @@
   # -------------------------------------------------
   - name: Network Info
     ansible.windows.win_shell: |
-      $net = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.NetAdapter.Name -notmatch "VMware|Hyper-V|VirtualBox|vEthernet" } | Select-Object -First 1
+      $net = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Get-NetIPConfiguration | Where-Object { $_.IPv4Address } | Select-Object -First 1
 
       @{
         ip     = $net.IPv4Address.IPAddress
@@ -334,7 +334,7 @@
       }
 
       @{
-        service = $service.Status
+        service = $service.Status.ToString()
         source  = ($source | Out-String).Trim()
         type    = $type
       } | ConvertTo-Json -Compress
