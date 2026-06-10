@@ -1,0 +1,63 @@
+---
+- name: Get AD Computers and Build Inventory
+  hosts: domain_controllers
+  gather_facts: no
+
+  tasks:
+
+    - name: Run AD computer query (clean output)
+      ansible.windows.win_powershell:
+        script: |
+          Get-ADComputer -Filter * -Properties DNSHostName |
+          ForEach-Object {
+
+              # Skip if no DNS name
+              if (-not $_.DNSHostName) { return }
+
+              try {
+                  $ip = Resolve-DnsName $_.DNSHostName -Type A -ErrorAction Stop |
+                        Select-Object -First 1 -ExpandProperty IPAddress
+              }
+              catch {
+                  return
+              }
+
+              # Only output valid records
+              if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                  [PSCustomObject]@{
+                      Name = $_.Name
+                      IP   = $ip
+                  }
+              }
+
+          } | ConvertTo-Json -Compress
+      register: result
+
+    - name: Build clean hosts.ini content
+      set_fact:
+        inventory_ini: |
+          [windows]
+          {% for item in (result.output[0] | from_json) %}
+          {{ item.IP | trim }}
+          {% endfor %}
+
+          [windows:vars]
+          ansible_connection=winrm
+          ansible_user=ncnet\username
+          ansible_password=********
+          ansible_port=5985
+          ansible_winrm_transport=ntlm
+          ansible_winrm_server_cert_validation=ignore
+          ansible_winrm_operation_timeout_sec=600
+          ansible_winrm_read_timeout_sec=600
+          ansible_winrm_connection_timeout=120
+          ansible_connection_timeout=120
+          ansible_winrm_message_encryption=auto
+          ansible_command_timeout=600
+
+    - name: Save inventory file on controller
+      delegate_to: localhost
+      run_once: true
+      copy:
+        content: "{{ inventory_ini }}"
+        dest: /reports/hosts.ini
